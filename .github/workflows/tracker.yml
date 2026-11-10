@@ -1,0 +1,58 @@
+name: GitHub Projects Automation
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-issue-to-done:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Move linked issue to Done
+        if: github.event.pull_request.merged == true
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: "1"
+        run: |
+          API=https://api.github.com/graphql
+
+          # 1. Find the issue number in the PR description ("Closes #12")
+          ISSUE_NUMBER=$(echo "$PR_BODY" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -n1)
+          if [ -z "$ISSUE_NUMBER" ]; then
+            echo "No linked issue found in PR description"
+            exit 0
+          fi
+          echo "Linked issue: #$ISSUE_NUMBER"
+
+          # 2. Look up the project, its Status field and the Done option
+          Q='query($owner:String!,$num:Int!){user(login:$owner){projectV2(number:$num){id field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}}}}'
+          RESP=$(jq -n --arg q "$Q" --arg owner "$OWNER" --argjson num "$PROJECT_NUMBER" \
+            '{query:$q,variables:{owner:$owner,num:$num}}' \
+            | curl -s -X POST "$API" -H "Authorization: Bearer $GH_TOKEN" -d @-)
+          PROJECT_ID=$(echo "$RESP" | jq -r '.data.user.projectV2.id')
+          FIELD_ID=$(echo "$RESP" | jq -r '.data.user.projectV2.field.id')
+          DONE_ID=$(echo "$RESP" | jq -r '.data.user.projectV2.field.options[] | select(.name=="Done") | .id')
+          echo "Project: $PROJECT_ID Field: $FIELD_ID Done: $DONE_ID"
+
+          # 3. Get the issue's node id
+          ISSUE_NODE_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER" | jq -r '.node_id')
+
+          # 4. Make sure the issue is on the board and get its item id
+          M1='mutation($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c}){item{id}}}'
+          ITEM_ID=$(jq -n --arg q "$M1" --arg p "$PROJECT_ID" --arg c "$ISSUE_NODE_ID" \
+            '{query:$q,variables:{p:$p,c:$c}}' \
+            | curl -s -X POST "$API" -H "Authorization: Bearer $GH_TOKEN" -d @- \
+            | jq -r '.data.addProjectV2ItemById.item.id')
+
+          # 5. Set Status = Done
+          M2='mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$o}}){projectV2Item{id}}}'
+          jq -n --arg q "$M2" --arg p "$PROJECT_ID" --arg i "$ITEM_ID" --arg f "$FIELD_ID" --arg o "$DONE_ID" \
+            '{query:$q,variables:{p:$p,i:$i,f:$f,o:$o}}' \
+            | curl -s -X POST "$API" -H "Authorization: Bearer $GH_TOKEN" -d @-
